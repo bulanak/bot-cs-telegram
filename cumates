@@ -1,0 +1,946 @@
+import sqlite3
+import time
+import os
+import re
+import html
+import random
+import pathlib
+import logging
+from datetime import datetime
+from telethon import TelegramClient, events, Button
+
+# =========================================================
+# KONFIGURASI
+# =========================================================
+API_ID   = int(os.environ.get("API_ID", 35443397))
+API_HASH = os.environ.get("API_HASH", "4888086e2b51b7f0fb98de5eb419e468")
+GROUP_ADMIN_ID = int(os.environ.get("GROUP_ADMIN_ID", -1004488215589))
+
+SPAM_COOLDOWN = 30
+DB_NAME       = "bot_cs_data.db"
+MEDIA_DIR     = pathlib.Path("media_templates")
+MAX_TEMPLATE  = 10
+
+MEDIA_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()],
+)
+log = logging.getLogger("csbot")
+
+client = TelegramClient('sesi_cs_pribadi', API_ID, API_HASH)
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("CREATE TABLE IF NOT EXISTS responded_users (user_id INTEGER PRIMARY KEY)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS templates (
+                key TEXT PRIMARY KEY,
+                text TEXT,
+                file_path TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS report_messages (
+                message_id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS muted_users (
+                user_id INTEGER PRIMARY KEY,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_users (
+                user_id INTEGER PRIMARY KEY,
+                reason TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nama_admin', 'Siti')")
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('is_store_open', 'True')")
+        conn.commit()
+
+
+def get_setting(key, default=None):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+
+def update_setting(key, value):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE settings SET value = ? WHERE key = ?", (value, key))
+        conn.commit()
+
+
+# =========================================================
+# HELPER TEMPLATE
+# =========================================================
+def get_template(key: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT text, file_path FROM templates WHERE key = ?", (key,))
+        return cur.fetchone()
+
+
+def upsert_template_text(key: str, text: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO templates (key, text) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET text = excluded.text
+        """, (key, text))
+        conn.commit()
+
+
+def upsert_template_media(key: str, file_path: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO templates (key, file_path) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET file_path = excluded.file_path
+        """, (key, file_path))
+        conn.commit()
+
+
+def clear_template_media(key: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT file_path FROM templates WHERE key = ?", (key,))
+        row = cur.fetchone()
+        if row and row[0]:
+            try:
+                os.remove(row[0])
+            except FileNotFoundError:
+                pass
+        cur.execute("UPDATE templates SET file_path = NULL WHERE key = ?", (key,))
+        conn.commit()
+
+
+def delete_template(key: str):
+    clear_template_media(key)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM templates WHERE key = ?", (key,))
+        conn.commit()
+
+
+def list_all_templates():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT key, text, file_path FROM templates ORDER BY key")
+        return cur.fetchall()
+
+
+def save_report_message(message_id: int, user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO report_messages (message_id, user_id) VALUES (?, ?)",
+            (message_id, user_id),
+        )
+        conn.commit()
+
+
+def get_user_from_report(message_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM report_messages WHERE message_id = ?", (message_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+async def send_template(target: int, key: str):
+    if is_blocked(target):
+        return False, "User sedang diblokir."
+    tmpl = get_template(key)
+    if not tmpl:
+        return False, f"Template {key} belum ada."
+
+    text_content, file_path = tmpl
+    try:
+        if file_path and os.path.exists(file_path):
+            await client.send_file(target, file_path, caption=text_content or "")
+        else:
+            await client.send_message(target, text_content or "-")
+        return True, None
+    except Exception as e:
+        log.error(f"[SEND TEMPLATE {key}] {type(e).__name__}: {e}")
+        return False, f"{type(e).__name__}: {e}"
+
+
+# =========================================================
+# HELPER USER
+# =========================================================
+_memory_users: set[int] = set()
+_last_message_time: dict[int, float] = {}
+_muted_cache: set[int] = set()
+_blocked_cache: set[int] = set()
+
+
+def is_user_responded(user_id: int) -> bool:
+    if user_id in _memory_users:
+        return True
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM responded_users WHERE user_id = ?", (user_id,))
+        found = cur.fetchone() is not None
+    if found:
+        _memory_users.add(user_id)
+    return found
+
+
+def add_responded_user(user_id: int):
+    _memory_users.add(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO responded_users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+
+def is_spamming(user_id: int) -> bool:
+    now = time.time()
+    last = _last_message_time.get(user_id, 0)
+    if now - last < SPAM_COOLDOWN:
+        return True
+    _last_message_time[user_id] = now
+    return False
+
+
+def _count_users() -> int:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM responded_users")
+        return cur.fetchone()[0]
+
+
+# =========================================================
+# HELPER: MUTE / BLOCK
+# =========================================================
+def is_muted(user_id: int) -> bool:
+    if user_id in _muted_cache:
+        return True
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM muted_users WHERE user_id = ?", (user_id,))
+        found = cur.fetchone() is not None
+    if found:
+        _muted_cache.add(user_id)
+    return found
+
+
+def is_blocked(user_id: int) -> bool:
+    if user_id in _blocked_cache:
+        return True
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM blocked_users WHERE user_id = ?", (user_id,))
+        found = cur.fetchone() is not None
+    if found:
+        _blocked_cache.add(user_id)
+    return found
+
+
+def mute_user(user_id: int):
+    _muted_cache.add(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO muted_users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+
+def unmute_user(user_id: int):
+    _muted_cache.discard(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM muted_users WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def block_user(user_id: int, reason: str = ""):
+    _blocked_cache.add(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO blocked_users (user_id, reason) VALUES (?, ?)",
+            (user_id, reason),
+        )
+        conn.commit()
+
+
+def unblock_user(user_id: int):
+    _blocked_cache.discard(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM blocked_users WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def list_muted() -> list:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM muted_users ORDER BY created_at DESC")
+        return [r[0] for r in cur.fetchall()]
+
+
+def list_blocked() -> list:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, reason FROM blocked_users ORDER BY created_at DESC")
+        return cur.fetchall()
+
+
+# =========================================================
+# TEMPLATE PESAN (RANDOM 5 VARIASI)
+# =========================================================
+_last_choice: dict[str, str] = {}
+
+
+def _pick(variants: list, key: str) -> str:
+    if len(variants) == 1:
+        return variants[0]
+    prev = _last_choice.get(key)
+    choices = [v for v in variants if v != prev] or variants
+    chosen = random.choice(choices)
+    _last_choice[key] = chosen
+    return chosen
+
+
+def msg_welcome() -> str:
+    return _pick([
+        "Halo Kak 👋 Pesan Kakak sudah kami terima.\nMohon tunggu sebentar ya, admin akan segera membantu. 🙏",
+        "Hai Kak 😊 Terima kasih sudah menghubungi kami.\nAdmin akan segera merespons, mohon ditunggu ya. 🙏",
+        "Halo Kak 👋 Terima kasih sudah chat.\nPesan Kakak sedang kami proses, mohon tunggu sebentar. 😊",
+        "Hai Kak 🙏 Pesan sudah masuk.\nMohon tunggu ya, admin kami akan segera membantu.",
+        "Halo Kak 😊 Terima kasih sudah menghubungi CS kami.\nMohon tunggu sebentar, admin segera merespons. 🙏",
+    ], key="welcome")
+
+
+def msg_closed() -> str:
+    return _pick([
+        "Halo Kak 🙏 Mohon maaf, CS kami sedang TUTUP.\nPesan Kakak akan kami balas saat buka kembali. 🕐",
+        "Hai Kak 😊 Maaf ya, saat ini CS sedang tidak aktif.\nPesan Kakak sudah kami simpan dan akan dibalas nanti. 🙏",
+        "Halo Kak 🕐 CS kami sedang di luar jam operasional.\nTenang, pesan Kakak akan segera kami balas saat buka. 🙏",
+        "Hai Kak 🙏 Mohon maaf, layanan CS sedang TUTUP.\nPesan Kakak kami simpan, akan dibalas saat kami buka kembali. 😊",
+        "Halo Kak 😊 Maaf, CS kami sedang tidak tersedia.\nPesan Kakak akan segera dibalas saat jam operasional. 🙏",
+    ], key="closed")
+
+
+def generate_ticket_id(user_id: int) -> str:
+    tgl = datetime.now().strftime("%y%m%d")
+    nomor = str(user_id)[-4:].zfill(4)
+    return f"CS-{tgl}-{nomor}"
+
+
+def msg_connected(nama_admin: str, user=None, user_id: int = None) -> str:
+    waktu = datetime.now().strftime("%d %b %Y • %H:%M")
+    tiket = generate_ticket_id(user_id or 0)
+    nama_user = html.escape(user.first_name) if user and user.first_name else "Pelanggan"
+
+    sapaan = random.choice([
+        "🎉 <b>TERHUBUNG DENGAN CS</b>",
+        "✨ <b>KAKAK SUDAH TERHUBUNG</b>",
+        "🔗 <b>KONEKSI BERHASIL</b>",
+        "💫 <b>ADMIN SIAP MEMBANTU</b>",
+        "🌟 <b>SESI CS DIMULAI</b>",
+    ])
+
+    closing = random.choice([
+        "Silakan sampaikan pertanyaan atau keluhan Kakak. Kami siap membantu! 😊",
+        "Ada yang bisa kami bantu, Kak? Silakan sampaikan ya. 🙏",
+        "Mohon sampaikan pesan Kakak, kami akan segera memprosesnya. ✨",
+        "Kami mendengarkan, Kak. Silakan sampaikan keluhan atau pertanyaan. 💬",
+        "Sampaikan apa yang bisa kami bantu, Kak. Kami siap membantu. 🚀",
+    ])
+
+    return (
+        f"{sapaan}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎫 <b>No. Tiket</b>  : <code>{tiket}</code>\n"
+        f"👤 <b>Pelanggan</b>  : {nama_user}\n"
+        f"👩‍💼 <b>Admin CS</b>   : <b>{html.escape(nama_admin)}</b>\n"
+        f"🕐 <b>Waktu</b>      : {waktu}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{closing}\n\n"
+        "<i>💡 Simpan nomor tiket untuk referensi ya, Kak.</i>"
+    )
+
+
+def keyboard_connected(user_id: int):
+    return [
+        [
+            Button.inline("📞 Panggil Admin", data=f"call_{user_id}"),
+            Button.inline("✅ Akhiri Sesi", data=f"endsession_{user_id}"),
+        ],
+    ]
+
+
+def msg_report(sender, text: str) -> str:
+    uname = f"@{sender.username}" if sender.username else "Tidak tersedia"
+    waktu = datetime.now().strftime("%d %b %Y • %H:%M")
+    safe_text = html.escape(text or "[Media]")
+    safe_name = html.escape(sender.first_name or "-")
+
+    return (
+        "📩 <b>PELANGGAN BARU MASUK</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Nama</b>     : {safe_name}\n"
+        f"🔗 <b>Username</b> : {uname}\n"
+        f"🆔 <b>User ID</b>  : <code>{sender.id}</code>\n"
+        f"🕐 <b>Waktu</b>    : {waktu}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💬 <b>Pesan:</b>\n<blockquote>{safe_text}</blockquote>\n\n"
+        "💡 <i>Reply pesan ini + ketik .t1–.t10 untuk balas cepat.</i>"
+    )
+
+
+# =========================================================
+# 1. COMMAND ADMIN
+# =========================================================
+@client.on(events.NewMessage(outgoing=True))
+async def owner_commands(event):
+    text = event.raw_text.strip()
+
+    # ── .admin NamaBaru ────────────────────────────────
+    if text.startswith('.admin '):
+        nama_baru = text.split('.admin ', 1)[1].strip()
+        if nama_baru:
+            update_setting('nama_admin', nama_baru)
+            await event.edit(f"✅ Nama admin CS: <b>{nama_baru}</b>", parse_mode='html')
+        else:
+            await event.edit("⚠️ Format: <code>.admin NamaAdmin</code>", parse_mode='html')
+
+    # ── .open / .close / .status ───────────────────────
+    elif text == '.open':
+        update_setting('is_store_open', 'True')
+        await event.edit("🟢 <b>STATUS CS: BUKA</b>", parse_mode='html')
+
+    elif text == '.close':
+        update_setting('is_store_open', 'False')
+        await event.edit("🔴 <b>STATUS CS: TUTUP</b>", parse_mode='html')
+
+    elif text == '.status':
+        nama_aktif = get_setting('nama_admin')
+        is_open    = get_setting('is_store_open') == 'True'
+        status     = "🟢 BUKA" if is_open else "🔴 TUTUP"
+        total_user = len(_memory_users) or _count_users()
+        await event.edit(
+            "📊 <b>STATUS CS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👩‍💼 <b>Admin</b>     : {nama_aktif}\n"
+            f"🏪 <b>Status</b>    : {status}\n"
+            f"👥 <b>Pelanggan</b> : {total_user}\n"
+            f"🔕 <b>Bisukan</b>   : {len(_muted_cache)}\n"
+            f"🚫 <b>Blokir</b>    : {len(_blocked_cache)}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💡 <b>Perintah:</b>\n"
+            "<code>.admin Nama</code> · <code>.open</code> · <code>.close</code> · <code>.status</code>\n"
+            "<code>.terhubung USER_ID</code>\n"
+            "<code>.bisukan USER_ID</code> · <code>.suara USER_ID</code>\n"
+            "<code>.blok USER_ID [alasan]</code> · <code>.unblok USER_ID</code>\n"
+            "<code>.listbisukan</code> · <code>.listblok</code>\n\n"
+            "📨 <b>Template:</b>\n"
+            "<code>.set t1 Teks</code> · <code>.setgambar t1</code> (reply foto)\n"
+            "<code>.delgambar t1</code> · <code>.del t1</code> · <code>.listt</code>\n"
+            "<code>.t1</code> … <code>.t10</code> → kirim balasan cepat",
+            parse_mode='html'
+        )
+
+    # ── .terhubung USER_ID ─────────────────────────────
+    elif text.startswith('.terhubung '):
+        arg = text.split('.terhubung ', 1)[1].strip()
+        if not arg.isdigit():
+            await event.edit("⚠️ Format: <code>.terhubung 123456789</code>", parse_mode='html')
+            return
+
+        target_user_id = int(arg)
+
+        if is_blocked(target_user_id):
+            await event.edit(
+                f"🚫 User <code>{target_user_id}</code> sedang diblokir.\n"
+                f"Buka dulu dengan <code>.unblok {target_user_id}</code>",
+                parse_mode='html'
+            )
+            return
+
+        nama_aktif = get_setting('nama_admin')
+        try:
+            target_user = await client.get_entity(target_user_id)
+        except Exception:
+            target_user = None
+
+        try:
+            sent = await client.send_message(
+                target_user_id,
+                msg_connected(nama_aktif, user=target_user, user_id=target_user_id),
+                parse_mode='html',
+                buttons=keyboard_connected(target_user_id),
+            )
+            try:
+                await client.pin_message(target_user_id, sent.id, notify=True)
+            except Exception as pin_err:
+                log.warning(f"[PIN] {pin_err}")
+
+            await event.edit(
+                f"✅ <b>TERHUBUNG + PIN</b>\n"
+                f"🆔 <code>{target_user_id}</code>\n"
+                f"👩‍💼 {nama_aktif}",
+                parse_mode='html'
+            )
+        except Exception as e:
+            await event.edit(f"❌ Gagal: <code>{type(e).__name__}</code>", parse_mode='html')
+
+    # ── .bisukan USER_ID ───────────────────────────────
+    elif re.match(r"^\.bisukan\s+(\d+)$", text):
+        uid = int(re.match(r"^\.bisukan\s+(\d+)$", text).group(1))
+        mute_user(uid)
+        await event.edit(
+            f"🔕 <b>USER DIBISUKAN</b>\n\n"
+            f"🆔 <code>{uid}</code>\n\n"
+            f"Bot tidak akan auto-reply ke user ini, tapi admin masih bisa manual chat.\n"
+            f"Buka dengan <code>.suara {uid}</code>",
+            parse_mode='html'
+        )
+
+    # ── .suara USER_ID ─────────────────────────────────
+    elif re.match(r"^\.suara\s+(\d+)$", text):
+        uid = int(re.match(r"^\.suara\s+(\d+)$", text).group(1))
+        unmute_user(uid)
+        await event.edit(
+            f"🔔 <b>USER DIAKTIFKAN KEMBALI</b>\n\n🆔 <code>{uid}</code>",
+            parse_mode='html'
+        )
+
+    # ── .blok USER_ID [alasan] ─────────────────────────
+    elif re.match(r"^\.blok\s+(\d+)(?:\s+(.+))?$", text):
+        m = re.match(r"^\.blok\s+(\d+)(?:\s+(.+))?$", text)
+        uid = int(m.group(1))
+        reason = (m.group(2) or "").strip()
+        block_user(uid, reason)
+        await event.edit(
+            f"🚫 <b>USER DIBLOKIR</b>\n\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"📝 Alasan: {html.escape(reason) if reason else '(tidak ada)'}\n\n"
+            f"Pesan dari user ini akan diabaikan.\n"
+            f"Buka dengan <code>.unblok {uid}</code>",
+            parse_mode='html'
+        )
+
+    # ── .unblok USER_ID ────────────────────────────────
+    elif re.match(r"^\.unblok\s+(\d+)$", text):
+        uid = int(re.match(r"^\.unblok\s+(\d+)$", text).group(1))
+        unblock_user(uid)
+        await event.edit(
+            f"✅ <b>USER DIBUKA BLOKIRNYA</b>\n\n🆔 <code>{uid}</code>",
+            parse_mode='html'
+        )
+
+    # ── .listbisukan ───────────────────────────────────
+    elif text == '.listbisukan':
+        users = list_muted()
+        if not users:
+            await event.edit("📭 Tidak ada user yang dibisukan.", parse_mode='html')
+            return
+        lines = [f"🔕 <b>DAFTAR BISUKAN ({len(users)})</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for uid in users:
+            lines.append(f"• <code>{uid}</code>")
+        await event.edit("\n".join(lines), parse_mode='html')
+
+    # ── .listblok ──────────────────────────────────────
+    elif text == '.listblok':
+        users = list_blocked()
+        if not users:
+            await event.edit("📭 Tidak ada user yang diblokir.", parse_mode='html')
+            return
+        lines = [f"🚫 <b>DAFTAR BLOKIR ({len(users)})</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for uid, reason in users:
+            r = f" — {html.escape(reason)}" if reason else ""
+            lines.append(f"• <code>{uid}</code>{r}")
+        await event.edit("\n".join(lines), parse_mode='html')
+
+    # =================================================
+    # TEMPLATE SYSTEM
+    # =================================================
+
+    # ── .set t1 Teks ───────────────────────────────────
+    elif re.match(r"^\.set\s+t(\d{1,2})\s+([\s\S]+)$", text):
+        m = re.match(r"^\.set\s+t(\d{1,2})\s+([\s\S]+)$", text)
+        n = int(m.group(1))
+        if not (1 <= n <= MAX_TEMPLATE):
+            await event.edit(f"⚠️ Nomor template hanya 1–{MAX_TEMPLATE}.")
+            return
+        key = f"t{n}"
+        content = m.group(2).strip()
+        upsert_template_text(key, content)
+        preview = html.escape(content[:300]) + ("…" if len(content) > 300 else "")
+        await event.edit(
+            f"✅ <b>Template {key} disimpan</b>\n\n<blockquote>{preview}</blockquote>",
+            parse_mode='html'
+        )
+
+    # ── .setgambar t1 (reply foto) ─────────────────────
+    elif re.match(r"^\.setgambar\s+t(\d{1,2})$", text):
+        n = int(re.match(r"^\.setgambar\s+t(\d{1,2})$", text).group(1))
+        if not (1 <= n <= MAX_TEMPLATE):
+            await event.edit(f"⚠️ Nomor template hanya 1–{MAX_TEMPLATE}.")
+            return
+        key = f"t{n}"
+
+        if not event.reply_to_msg_id:
+            await event.edit(
+                f"⚠️ <b>Reply ke foto</b> dulu, lalu kirim <code>.setgambar {key}</code>",
+                parse_mode='html'
+            )
+            return
+
+        replied = await event.get_reply_message()
+        if not replied or not replied.media:
+            await event.edit("⚠️ Pesan yang di-reply bukan gambar/media.")
+            return
+
+        await event.edit(f"⏳ Mengunduh media untuk <b>{key}</b>...", parse_mode='html')
+        try:
+            ext = ".jpg"
+            if replied.document and replied.document.mime_type:
+                mt = replied.document.mime_type
+                if "png" in mt: ext = ".png"
+                elif "gif" in mt: ext = ".gif"
+                elif "mp4" in mt: ext = ".mp4"
+                elif "webp" in mt: ext = ".webp"
+
+            for old in MEDIA_DIR.glob(f"{key}.*"):
+                try: old.unlink()
+                except: pass
+
+            file_path = str(MEDIA_DIR / f"{key}{ext}")
+            await client.download_media(replied, file=file_path)
+            upsert_template_media(key, file_path)
+
+            await event.edit(
+                f"✅ <b>Gambar disimpan ke {key}</b>\n\n"
+                f"📁 <code>{file_path}</code>\n\n"
+                f"Ketik <code>.{key}</code> → gambar + caption otomatis terkirim.",
+                parse_mode='html'
+            )
+        except Exception as e:
+            log.error(f"[SETGAMBAR] {e}")
+            await event.edit(f"❌ Gagal download: <code>{html.escape(str(e))}</code>", parse_mode='html')
+
+    # ── .delgambar t1 ──────────────────────────────────
+    elif re.match(r"^\.delgambar\s+t(\d{1,2})$", text):
+        n = int(re.match(r"^\.delgambar\s+t(\d{1,2})$", text).group(1))
+        if not (1 <= n <= MAX_TEMPLATE):
+            return
+        key = f"t{n}"
+        clear_template_media(key)
+        await event.edit(f"✅ Gambar pada <code>{key}</code> dihapus.", parse_mode='html')
+
+    # ── .del t1 ────────────────────────────────────────
+    elif re.match(r"^\.del\s+t(\d{1,2})$", text):
+        n = int(re.match(r"^\.del\s+t(\d{1,2})$", text).group(1))
+        if not (1 <= n <= MAX_TEMPLATE):
+            return
+        key = f"t{n}"
+        delete_template(key)
+        await event.edit(f"🗑️ Template <code>{key}</code> dihapus.", parse_mode='html')
+
+    # ── .listt ─────────────────────────────────────────
+    elif text == '.listt':
+        rows = list_all_templates()
+        if not rows:
+            await event.edit(
+                "📭 Belum ada template.\n\nBuat dengan: <code>.set t1 Halo Kak...</code>",
+                parse_mode='html'
+            )
+            return
+
+        lines = ["📋 <b>DAFTAR TEMPLATE</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for key, content, file_path in rows:
+            has_media = "🖼️" if (file_path and os.path.exists(file_path)) else "📝"
+            preview = (content or "(tanpa teks)").replace("\n", " ")
+            if len(preview) > 60:
+                preview = preview[:60] + "…"
+            lines.append(f"{has_media} <b>{key}</b> → {html.escape(preview)}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("💡 Ketik <code>.t1</code> … <code>.t10</code> untuk kirim.")
+        await event.edit("\n".join(lines), parse_mode='html')
+
+    # ── .t1 … .t10 [USER_ID] ───────────────────────────
+    elif re.match(r"^\.t(\d{1,2})(?:\s+(\d+))?$", text):
+        m = re.match(r"^\.t(\d{1,2})(?:\s+(\d+))?$", text)
+        n = int(m.group(1))
+        explicit_target = int(m.group(2)) if m.group(2) else None
+
+        if not (1 <= n <= MAX_TEMPLATE):
+            await event.edit(f"⚠️ Template hanya 1–{MAX_TEMPLATE}.")
+            return
+        key = f"t{n}"
+
+        tmpl = get_template(key)
+        if not tmpl:
+            await event.edit(
+                f"⚠️ Template <code>{key}</code> belum ada.\n"
+                f"Set: <code>.set {key} Teks balasan</code>",
+                parse_mode='html'
+            )
+            return
+
+        # KASUS 1: chat pribadi pelanggan
+        if event.is_private and explicit_target is None:
+            if is_blocked(event.chat_id):
+                await event.edit("🚫 User ini diblokir.")
+                return
+            text_content, file_path = tmpl
+            if file_path and os.path.exists(file_path):
+                await event.delete()
+                ok, err = await send_template(event.chat_id, key)
+                if not ok:
+                    await client.send_message(event.chat_id, f"❌ Gagal: {err}")
+            else:
+                await event.edit(text_content or "")
+            return
+
+        # KASUS 2 & 3: butuh target
+        target = explicit_target
+        if target is None and event.is_group and event.reply_to_msg_id:
+            target = get_user_from_report(event.reply_to_msg_id)
+
+        if target is None:
+            await event.edit(
+                "⚠️ <b>Target tidak diketahui.</b>\n\n"
+                "Cara pakai:\n"
+                "• Chat pribadi pelanggan → <code>.t1</code>\n"
+                "• Reply pesan laporan di grup → <code>.t1</code>\n"
+                "• Manual → <code>.t1 123456789</code>",
+                parse_mode='html'
+            )
+            return
+
+        ok, err = await send_template(target, key)
+        if ok:
+            await event.edit(
+                f"✅ Template <code>{key}</code> terkirim ke <code>{target}</code>",
+                parse_mode='html'
+            )
+        else:
+            await event.edit(
+                f"❌ <b>Gagal kirim:</b>\n<code>{html.escape(str(err))}</code>",
+                parse_mode='html'
+            )
+
+
+# =========================================================
+# 2. AUTO WELCOME + LAPORAN
+# =========================================================
+@client.on(events.NewMessage(incoming=True))
+async def auto_reply(event):
+    if not (event.is_private and not event.out):
+        return
+
+    sender_id = event.sender_id
+
+    if is_blocked(sender_id):
+        log.info(f"[BLOCKED] Pesan dari {sender_id} diabaikan.")
+        return
+
+    if is_muted(sender_id):
+        log.info(f"[MUTED] Pesan dari {sender_id} diterima (tanpa auto-reply).")
+        return
+
+    is_open = get_setting('is_store_open') == 'True'
+
+    if not is_open:
+        if not is_user_responded(sender_id):
+            await event.reply(msg_closed())
+            add_responded_user(sender_id)
+        return
+
+    if is_spamming(sender_id):
+        return
+
+    if not is_user_responded(sender_id):
+        sender = await event.get_sender()
+        await event.reply(msg_welcome())
+        add_responded_user(sender_id)
+
+        keyboard = [
+            [Button.inline("🔗 Hubungkan", data=f"connect_{sender_id}")],
+            [
+                Button.inline("👤 Profil", data=f"profile_{sender_id}"),
+                Button.inline("✅ Selesai", data=f"done_{sender_id}"),
+            ],
+        ]
+
+        try:
+            report_text = event.raw_text or "📎 [Media]"
+            report_msg = await client.send_message(
+                GROUP_ADMIN_ID,
+                msg_report(sender, report_text),
+                parse_mode='html',
+                buttons=keyboard,
+            )
+            save_report_message(report_msg.id, sender_id)
+            log.info(f"[REPORT] user={sender_id} msg_id={report_msg.id}")
+        except Exception as e:
+            log.error(f"[ERROR GRUP] {type(e).__name__}: {e}")
+
+
+# =========================================================
+# 3. HANDLE TOMBOL
+# =========================================================
+@client.on(events.CallbackQuery())
+async def handle_callback(event):
+    data = event.data.decode()
+
+    # ── Connect ────────────────────────────────────────
+    if data.startswith("connect_"):
+        try:
+            target_user_id = int(data.split("_", 1)[1])
+        except (IndexError, ValueError):
+            return await event.answer("⚠️ Data tidak valid.", alert=True)
+
+        if is_blocked(target_user_id):
+            return await event.answer("🚫 User diblokir.", alert=True)
+
+        nama_aktif = get_setting('nama_admin')
+        try:
+            target_user = await client.get_entity(target_user_id)
+        except Exception:
+            target_user = None
+
+        try:
+            sent = await client.send_message(
+                target_user_id,
+                msg_connected(nama_aktif, user=target_user, user_id=target_user_id),
+                parse_mode='html',
+                buttons=keyboard_connected(target_user_id),
+            )
+            try:
+                await client.pin_message(target_user_id, sent.id, notify=True)
+            except Exception as pin_err:
+                log.warning(f"[PIN] {pin_err}")
+        except Exception as e:
+            log.error(f"[ERROR SEND] {e}")
+            return await event.answer("❌ Gagal menghubungi pelanggan.", alert=True)
+
+        new_buttons = [[
+            Button.inline("👤 Profil", data=f"profile_{target_user_id}"),
+            Button.inline("✅ Selesai", data=f"done_{target_user_id}"),
+        ]]
+        await event.edit(
+            text=event.message.text + f"\n\n✅ <b>STATUS:</b> Terhubung dengan <b>{nama_aktif}</b> (📌 di-pin).",
+            buttons=new_buttons,
+            parse_mode='html'
+        )
+        await event.answer(f"✅ Terhubung dengan {nama_aktif} & di-pin.")
+
+    # ── Profil ─────────────────────────────────────────
+    elif data.startswith("profile_"):
+        try:
+            target_user_id = int(data.split("_", 1)[1])
+        except (IndexError, ValueError):
+            return await event.answer("⚠️ Data tidak valid.", alert=True)
+        try:
+            user = await client.get_entity(target_user_id)
+            uname = f"@{user.username}" if user.username else "Tidak tersedia"
+            info = (
+                f"👤 Profil Pelanggan\n"
+                f"━━━━━━━━━━━━━━━━━\n"
+                f"Nama     : {user.first_name or '-'}\n"
+                f"Username : {uname}\n"
+                f"User ID  : {user.id}"
+            )
+            await event.answer(info, alert=True)
+        except Exception as e:
+            log.error(f"[ERROR PROFILE] {e}")
+            await event.answer("❌ Tidak bisa memuat profil.", alert=True)
+
+    # ── Done (dari grup admin) ─────────────────────────
+    elif data.startswith("done_"):
+        await event.edit(
+            text=event.message.text + "\n\n✅ <b>STATUS:</b> Percakapan ditandai selesai.",
+            buttons=None,
+            parse_mode='html'
+        )
+        await event.answer("✅ Percakapan ditandai selesai.")
+
+    # ── Panggil admin (dari pelanggan) ─────────────────
+    elif data.startswith("call_"):
+        try:
+            target_user_id = int(data.split("_", 1)[1])
+        except (IndexError, ValueError):
+            return await event.answer("⚠️ Data tidak valid.", alert=True)
+
+        nama_aktif = get_setting('nama_admin')
+        await event.answer("📞 Admin telah diberitahu, mohon tunggu ya.", alert=True)
+
+        try:
+            await client.send_message(
+                GROUP_ADMIN_ID,
+                f"🔔 <b>PANGGILAN PELANGGAN</b>\n\n"
+                f"🆔 User ID: <code>{target_user_id}</code>\n"
+                f"👩‍💼 Admin  : {nama_aktif}\n"
+                f"💬 Pelanggan menekan tombol <b>Panggil Admin</b>.\n\n"
+                f"Mohon segera direspons ya. 🙏",
+                parse_mode='html'
+            )
+        except Exception as e:
+            log.error(f"[CALL] {e}")
+
+    # ── Akhiri sesi (dari pelanggan) ───────────────────
+    elif data.startswith("endsession_"):
+        try:
+            target_user_id = int(data.split("_", 1)[1])
+        except (IndexError, ValueError):
+            return await event.answer("⚠️ Data tidak valid.", alert=True)
+
+        try:
+            await client.unpin_message(target_user_id)
+        except Exception as e:
+            log.warning(f"[UNPIN] {e}")
+
+        await event.edit(
+            "🙏 <b>TERIMA KASIH</b>\n\n"
+            "Sesi CS ini telah berakhir.\n\n"
+            "Kalau butuh bantuan lagi, silakan chat kami kembali ya, Kak. 😊\n\n"
+            "<i>Semoga harimu menyenangkan! ✨</i>",
+            buttons=None,
+            parse_mode='html'
+        )
+        await event.answer("✅ Sesi diakhiri.")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    init_db()
+    print("=" * 50)
+    print("   USERBOT CS - FINAL EDITION")
+    print("=" * 50)
+    print(f"Admin  : {get_setting('nama_admin')}")
+    print(f"Status : {'BUKA' if get_setting('is_store_open') == 'True' else 'TUTUP'}")
+    print(f"Media  : {MEDIA_DIR.absolute()}")
+    print("-" * 50)
+    client.start()
+    print("✅ Bot aktif. Tekan Ctrl+C untuk berhenti.")
+    client.run_until_disconnected()
+
+
+if __name__ == '__main__':
+    main()

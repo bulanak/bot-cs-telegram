@@ -1,0 +1,995 @@
+import sqlite3
+import time
+import os
+import re
+import html
+import random
+import asyncio
+import pathlib
+import logging
+from datetime import datetime
+from telethon import TelegramClient, events, Button
+
+# =========================================================
+# KONFIGURASI
+# =========================================================
+API_ID   = int(os.environ.get("API_ID", 35443397))
+API_HASH = os.environ.get("API_HASH", "4888086e2b51b7f0fb98de5eb419e468")
+GROUP_ADMIN_ID = int(os.environ.get("GROUP_ADMIN_ID", -1004488215589))
+
+SPAM_COOLDOWN = 30
+FAQ_COOLDOWN  = 60
+DB_NAME       = "bot_cs_data.db"
+MEDIA_DIR     = pathlib.Path("media_templates")
+MAX_TEMPLATE  = 10
+
+MEDIA_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()],
+)
+log = logging.getLogger("csbot")
+
+client = TelegramClient('sesi_cs_pribadi', API_ID, API_HASH)
+
+# =========================================================
+# DATABASE
+# =========================================================
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("CREATE TABLE IF NOT EXISTS responded_users (user_id INTEGER PRIMARY KEY)")
+        cur.execute("CREATE TABLE IF NOT EXISTS templates (key TEXT PRIMARY KEY, text TEXT, file_path TEXT)")
+        cur.execute("CREATE TABLE IF NOT EXISTS report_messages (message_id INTEGER PRIMARY KEY, user_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS muted_users (user_id INTEGER PRIMARY KEY, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS blocked_users (user_id INTEGER PRIMARY KEY, reason TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS faq (keyword TEXT PRIMARY KEY, response TEXT NOT NULL, hit_count INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, note TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS ratings (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, rating INTEGER, comment TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+
+        defaults = {
+            'nama_admin': 'Siti',
+            'is_store_open': 'True',
+            'work_start': '08:00',
+            'work_end': '21:00',
+            'auto_hours': 'False',
+            'rating_enabled': 'True',
+            'welcome_hint': 'True',
+        }
+        for k, v in defaults.items():
+            cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+        conn.commit()
+
+def get_setting(key, default=None):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+def update_setting(key, value):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+        conn.commit()
+
+# =========================================================
+# WORKING HOURS
+# =========================================================
+def is_within_working_hours() -> bool:
+    start = get_setting('work_start', '08:00')
+    end = get_setting('work_end', '21:00')
+    now = datetime.now().strftime('%H:%M')
+    return start <= now <= end
+
+def check_auto_status():
+    if get_setting('auto_hours', 'False') != 'True':
+        return False
+    should_open = is_within_working_hours()
+    current = get_setting('is_store_open') == 'True'
+    if should_open != current:
+        update_setting('is_store_open', 'True' if should_open else 'False')
+        log.info(f"[AUTO] CS auto {'OPEN' if should_open else 'CLOSE'}")
+        return True
+    return False
+
+# =========================================================
+# HELPER TEMPLATE
+# =========================================================
+def get_template(key: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT text, file_path FROM templates WHERE key = ?", (key,))
+        return cur.fetchone()
+
+def upsert_template_text(key: str, text: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO templates (key, text) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET text = excluded.text", (key, text))
+        conn.commit()
+
+def upsert_template_media(key: str, file_path: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO templates (key, file_path) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET file_path = excluded.file_path", (key, file_path))
+        conn.commit()
+
+def clear_template_media(key: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT file_path FROM templates WHERE key = ?", (key,))
+        row = cur.fetchone()
+        if row and row[0]:
+            try: os.remove(row[0])
+            except FileNotFoundError: pass
+        cur.execute("UPDATE templates SET file_path = NULL WHERE key = ?", (key,))
+        conn.commit()
+
+def delete_template(key: str):
+    clear_template_media(key)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM templates WHERE key = ?", (key,))
+        conn.commit()
+
+def list_all_templates():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT key, text, file_path FROM templates ORDER BY key")
+        return cur.fetchall()
+
+def save_report_message(message_id: int, user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO report_messages (message_id, user_id) VALUES (?, ?)", (message_id, user_id))
+        conn.commit()
+
+def get_user_from_report(message_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM report_messages WHERE message_id = ?", (message_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+# =========================================================
+# FAQ
+# =========================================================
+def add_faq(keyword: str, response: str):
+    kw = keyword.strip().lower()
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO faq (keyword, response) VALUES (?, ?) ON CONFLICT(keyword) DO UPDATE SET response = excluded.response", (kw, response))
+        conn.commit()
+
+def delete_faq(keyword: str) -> bool:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM faq WHERE keyword = ?", (keyword.strip().lower(),))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        return deleted
+
+def list_faq():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT keyword, response, hit_count FROM faq ORDER BY hit_count DESC, keyword")
+        return cur.fetchall()
+
+def count_faq() -> int:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM faq")
+        return cur.fetchone()[0]
+
+_last_faq_time: dict = {}
+
+def check_faq(user_id: int, text: str):
+    now = time.time()
+    if now - _last_faq_time.get(user_id, 0) < FAQ_COOLDOWN:
+        return None
+    if not text: return None
+    text_lower = text.lower()
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT keyword, response FROM faq ORDER BY LENGTH(keyword) DESC")
+        for keyword, response in cur.fetchall():
+            if keyword in text_lower:
+                cur.execute("UPDATE faq SET hit_count = hit_count + 1 WHERE keyword = ?", (keyword,))
+                conn.commit()
+                _last_faq_time[user_id] = now
+                return response
+    return None
+
+# =========================================================
+# NOTES
+# =========================================================
+def add_note(user_id: int, note: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO notes (user_id, note) VALUES (?, ?)", (user_id, note))
+        conn.commit()
+
+def get_notes(user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT note, created_at FROM notes WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
+        return cur.fetchall()
+
+def delete_notes(user_id: int) -> int:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM notes WHERE user_id = ?", (user_id,))
+        n = cur.rowcount
+        conn.commit()
+        return n
+
+# =========================================================
+# RATINGS
+# =========================================================
+def add_rating(user_id: int, rating: int, comment: str = ""):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO ratings (user_id, rating, comment) VALUES (?, ?, ?)", (user_id, rating, comment))
+        conn.commit()
+
+def get_rating_stats():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), AVG(rating) FROM ratings")
+        count, avg = cur.fetchone()
+        return count or 0, round(avg or 0, 2)
+
+def get_user_rating(user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT rating, comment FROM ratings WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", (user_id,))
+        return cur.fetchone()
+
+# =========================================================
+# STATS
+# =========================================================
+def get_full_stats():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM responded_users"); total_users = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM muted_users"); total_muted = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM blocked_users"); total_blocked = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM faq"); total_faq = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM templates"); total_tpl = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*), AVG(rating) FROM ratings"); r_count, r_avg = cur.fetchone()
+        cur.execute("SELECT SUM(hit_count) FROM faq"); total_hit = cur.fetchone()[0] or 0
+    return {'users': total_users, 'muted': total_muted, 'blocked': total_blocked, 'faq': total_faq, 'templates': total_tpl, 'ratings': r_count or 0, 'avg_rating': round(r_avg or 0, 2), 'faq_hits': total_hit}
+
+# =========================================================
+# HELPER USER
+# =========================================================
+_memory_users: set = set()
+_last_message_time: dict = {}
+_spam_count: dict = {}
+_muted_cache: set = set()
+_blocked_cache: set = set()
+
+def is_user_responded(user_id: int) -> bool:
+    if user_id in _memory_users: return True
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM responded_users WHERE user_id = ?", (user_id,))
+        found = cur.fetchone() is not None
+    if found: _memory_users.add(user_id)
+    return found
+
+def add_responded_user(user_id: int):
+    _memory_users.add(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO responded_users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+def is_spamming(user_id: int) -> bool:
+    now = time.time()
+    last = _last_message_time.get(user_id, 0)
+    count = _spam_count.get(user_id, 0)
+    cooldown = SPAM_COOLDOWN + (count * 5)
+    if now - last < cooldown:
+        _spam_count[user_id] = min(count + 1, 10)
+        return True
+    _last_message_time[user_id] = now
+    if now - last > cooldown * 2: _spam_count[user_id] = 0
+    return False
+
+# =========================================================
+# MUTE / BLOCK
+# =========================================================
+def is_muted(user_id: int) -> bool:
+    if user_id in _muted_cache: return True
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM muted_users WHERE user_id = ?", (user_id,))
+        if cur.fetchone():
+            _muted_cache.add(user_id)
+            return True
+    return False
+
+def is_blocked(user_id: int) -> bool:
+    if user_id in _blocked_cache: return True
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM blocked_users WHERE user_id = ?", (user_id,))
+        if cur.fetchone():
+            _blocked_cache.add(user_id)
+            return True
+    return False
+
+def mute_user(user_id: int):
+    _muted_cache.add(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO muted_users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+def unmute_user(user_id: int):
+    _muted_cache.discard(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM muted_users WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+def block_user(user_id: int, reason: str = ""):
+    _blocked_cache.add(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO blocked_users (user_id, reason) VALUES (?, ?)", (user_id, reason))
+        conn.commit()
+
+def unblock_user(user_id: int):
+    _blocked_cache.discard(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM blocked_users WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+def list_muted():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM muted_users ORDER BY created_at DESC")
+        return [r[0] for r in cur.fetchall()]
+
+def list_blocked():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, reason FROM blocked_users ORDER BY created_at DESC")
+        return cur.fetchall()
+
+# =========================================================
+# TEXT TEMPLATES
+# =========================================================
+_last_choice: dict = {}
+
+def _pick(variants, key):
+    if len(variants) == 1: return variants[0]
+    prev = _last_choice.get(key)
+    choices = [v for v in variants if v != prev] or variants
+    chosen = random.choice(choices)
+    _last_choice[key] = chosen
+    return chosen
+
+def msg_welcome() -> str:
+    base = _pick([
+        "Halo Kak 👋 Terima kasih sudah menghubungi kami!\nPesan Kakak sudah masuk, admin akan segera merespons. 🙏",
+        "Hai Kak 😊 Selamat datang di CS kami.\nMohon tunggu sebentar ya, admin segera membantu. ✨",
+        "Halo Kak 👋 Pesan Kakak sudah kami terima.\nAdmin sedang bersiap, mohon ditunggu ya. 🙏",
+        "Hai Kak 😊 Terima kasih sudah chat.\nKeluhan atau pertanyaan Kakak akan segera kami proses. 🚀",
+        "Halo Kak 🙏 Terima kasih sudah menghubungi CS kami.\nMohon tunggu sebentar, admin akan segera hadir. ✨",
+        "Hai Kak 👋 Pesan Kakak sudah kami terima.\nMohon ditunggu ya, admin kami siap membantu. 😊",
+        "Halo Kak 😊 Terima kasih sudah menghubungi kami.\nAdmin akan segera merespons pesan Kakak. 🙏",
+        "Hai Kak 👋 Salam dari CS kami.\nPesan Kakak sedang dalam antrian, mohon tunggu sebentar. ⏳",
+        "Halo Kak 😊 Terima kasih sudah chat dengan kami.\nKami akan segera membantu Kakak. 🌟",
+        "Hai Kak 🙏 Pesan Kakak sudah masuk.\nTunggu sebentar ya, admin segera merespons. ✨",
+    ], key="welcome")
+    if get_setting('welcome_hint', 'True') == 'True' and count_faq() > 0:
+        base += "\n\n<i>💡 Butuh jawaban cepat? Coba ketik kata kunci seperti \"harga\", \"ongkir\", atau \"jam buka\".</i>"
+    return base
+
+def msg_closed() -> str:
+    start = get_setting('work_start', '08:00')
+    end = get_setting('work_end', '21:00')
+    jam = f"({start} - {end} WIB)" if get_setting('auto_hours') == 'True' else ""
+    return _pick([
+        f"Halo Kak 🙏 Mohon maaf, CS kami sedang <b>TUTUP</b>.\nPesan Kakak akan dibalas saat kami buka kembali {jam}. 🕐",
+        f"Hai Kak 😊 Maaf ya, saat ini CS sedang tidak aktif {jam}.\nPesan Kakak sudah kami simpan, akan dibalas nanti. 🙏",
+        f"Halo Kak 🕐 CS kami sedang di luar jam operasional {jam}.\nTenang, pesan Kakak akan segera kami balas saat buka. 🙏",
+        f"Hai Kak 🙏 Mohon maaf, layanan CS sedang TUTUP {jam}.\nPesan Kakak kami simpan, akan dibalas saat kami buka. 😊",
+        f"Halo Kak 😊 Maaf, CS kami sedang tidak tersedia {jam}.\nPesan Kakak akan segera dibalas saat jam operasional. 🙏",
+    ], key="closed")
+
+def generate_ticket_id(user_id: int) -> str:
+    return f"CS-{datetime.now().strftime('%y%m%d')}-{str(user_id)[-4:].zfill(4)}"
+
+def msg_connected(nama_admin: str, user=None, user_id: int = None) -> str:
+    waktu = datetime.now().strftime("%d %b %Y • %H:%M")
+    tiket = generate_ticket_id(user_id or 0)
+    nama_user = html.escape(user.first_name) if user and user.first_name else "Pelanggan"
+    sapaan = random.choice(["🎉 <b>TERHUBUNG DENGAN CS</b>", "✨ <b>KAKAK SUDAH TERHUBUNG</b>", "🔗 <b>KONEKSI BERHASIL</b>", "💫 <b>ADMIN SIAP MEMBANTU</b>", "🌟 <b>SESI CS DIMULAI</b>"])
+    closing = random.choice(["Silakan sampaikan pertanyaan atau keluhan Kakak. Kami siap membantu! 😊", "Ada yang bisa kami bantu, Kak? Silakan sampaikan ya. 🙏", "Mohon sampaikan pesan Kakak, kami akan segera memprosesnya. ✨", "Kami mendengarkan, Kak. Silakan sampaikan keluhan atau pertanyaan. 💬", "Sampaikan apa yang bisa kami bantu, Kak. Kami siap membantu. 🚀"])
+    return f"{sapaan}\n━━━━━━━━━━━━━━━━━━━━━━\n🎫 <b>No. Tiket</b>  : <code>{tiket}</code>\n👤 <b>Pelanggan</b>  : {nama_user}\n👩‍💼 <b>Admin CS</b>   : <b>{html.escape(nama_admin)}</b>\n🕐 <b>Waktu</b>      : {waktu}\n━━━━━━━━━━━━━━━━━━━━━━\n\n{closing}\n\n<i>💡 Simpan nomor tiket untuk referensi ya, Kak.</i>"
+
+def msg_ending() -> str:
+    return _pick([
+        "🙏 <b>TERIMA KASIH</b>\n\nPercakapan ini telah selesai.\nSenang bisa membantu Kakak hari ini. 😊\n\n<i>Kalau butuh bantuan lagi, silakan chat kami kembali ya! ✨</i>",
+        "✨ <b>SESI SELESAI</b>\n\nTerima kasih sudah menghubungi CS kami, Kak.\nSemoga masalahnya sudah teratasi ya. 🙏\n\n<i>Sampai jumpa lagi! 👋</i>",
+        "💫 <b>PERCAKAPAN DITUTUP</b>\n\nTerima kasih atas kepercayaan Kakak kepada kami.\nKami selalu siap membantu kapan pun dibutuhkan. 😊\n\n<i>Semoga harimu menyenangkan! 🌟</i>",
+        "🌟 <b>TERIMA KASIH SUDAH MENGHUBUNGI KAMI</b>\n\nSesi CS ini resmi berakhir.\nSemoga kami bisa membantu lagi di lain waktu, Kak. 🙏\n\n<i>Have a great day! ✨</i>",
+        "🎉 <b>SELESAI</b>\n\nTerima kasih sudah menghubungi kami, Kak.\nJika ada pertanyaan lain, jangan ragu untuk chat kami lagi. 😊\n\n<i>Sukses selalu untuk Kakak! 🚀</i>",
+    ], key="ending")
+
+def msg_rating_prompt() -> str:
+    return _pick(["⭐ <b>BAGAIMANA PELAYANAN KAMI?</b>\n\nBeri rating untuk membantu kami jadi lebih baik 🙏", "💫 <b>RATING PELAYANAN</b>\n\nSeberapa puas Kakak dengan bantuan kami hari ini?", "🌟 <b>PUAS DENGAN LAYANAN KAMI?</b>\n\nBeri bintang untuk pengalaman Kakak hari ini."], key="rating_prompt")
+
+def msg_report(sender, text: str) -> str:
+    uname = f"@{sender.username}" if sender.username else "Tidak tersedia"
+    waktu = datetime.now().strftime("%d %b %Y • %H:%M")
+    safe_text = html.escape(text or "[Media]")[:500]
+    safe_name = html.escape(sender.first_name or "-")
+    note = f"\n📝 <b>Catatan Admin</b>: {len(get_notes(sender.id))} entri" if get_notes(sender.id) else ""
+    rating = get_user_rating(sender.id)
+    rating_info = f"\n⭐ <b>Rating</b>: {'⭐' * rating[0]}" if rating else ""
+    return f"📩 <b>PELANGGAN BARU MASUK</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👤 <b>Nama</b>     : {safe_name}\n🔗 <b>Username</b> : {uname}\n🆔 <b>User ID</b>  : <code>{sender.id}</code>\n🕐 <b>Waktu</b>    : {waktu}{rating_info}{note}\n━━━━━━━━━━━━━━━━━━━━━━\n💬 <b>Pesan:</b>\n<blockquote>{safe_text}</blockquote>\n\n💡 <i>Reply pesan ini + ketik .t1–.t10 untuk balas cepat.</i>"
+
+# =========================================================
+# KEYBOARDS
+# =========================================================
+def keyboard_connected(user_id: int):
+    return [[Button.inline("📞 Panggil Admin", data=f"call_{user_id}"), Button.inline("✅ Akhiri Sesi", data=f"endsession_{user_id}")]]
+
+def keyboard_report(user_id: int):
+    return [[Button.inline("🔗 Hubungkan", data=f"connect_{user_id}")], [Button.inline("👤 Profil", data=f"profile_{user_id}"), Button.inline("📝 Note", data=f"note_{user_id}"), Button.inline("✅ Selesai", data=f"done_{user_id}")]]
+
+def keyboard_rating(user_id: int):
+    return [[Button.inline("⭐", data=f"rate_1_{user_id}"), Button.inline("⭐⭐", data=f"rate_2_{user_id}"), Button.inline("⭐⭐⭐", data=f"rate_3_{user_id}"), Button.inline("⭐⭐⭐⭐", data=f"rate_4_{user_id}"), Button.inline("⭐⭐⭐⭐⭐", data=f"rate_5_{user_id}")]]
+
+# =========================================================
+# SEND HELPERS
+# =========================================================
+async def send_template(target: int, key: str):
+    if is_blocked(target): return False, "User sedang diblokir."
+    tmpl = get_template(key)
+    if not tmpl: return False, f"Template {key} belum ada."
+    text_content, file_path = tmpl
+    try:
+        if file_path and os.path.exists(file_path): await client.send_file(target, file_path, caption=text_content or "")
+        else: await client.send_message(target, text_content or "-")
+        return True, None
+    except Exception as e:
+        log.error(f"[SEND TEMPLATE {key}] {type(e).__name__}: {e}")
+        return False, f"{type(e).__name__}: {e}"
+
+async def send_rating_prompt(user_id: int):
+    if get_setting('rating_enabled', 'True') != 'True': return
+    try: await client.send_message(user_id, msg_rating_prompt(), buttons=keyboard_rating(user_id), parse_mode='html')
+    except Exception as e: log.warning(f"[RATING PROMPT] {e}")
+
+async def broadcast_message(text: str, exclude: set = None):
+    exclude = exclude or set()
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM responded_users")
+        users = [r[0] for r in cur.fetchall() if r[0] not in exclude]
+    success, failed = 0, 0
+    for uid in users:
+        if is_blocked(uid):
+            failed += 1
+            continue
+        try:
+            await client.send_message(uid, text, parse_mode='html')
+            success += 1
+            await asyncio.sleep(0.15)
+        except Exception: failed += 1
+    return success, failed
+
+async def search_users(query: str, limit: int = 10):
+    results = []
+    query_low = query.lower()
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM responded_users")
+        all_users = [r[0] for r in cur.fetchall()]
+    for uid in all_users:
+        try:
+            user = await client.get_entity(uid)
+            name = (user.first_name or '').lower()
+            uname = (user.username or '').lower()
+            if query_low in name or query_low in uname or query in str(uid):
+                results.append(user)
+                if len(results) >= limit: break
+        except Exception: continue
+    return results
+
+# =========================================================
+# ADMIN COMMANDS
+# =========================================================
+@client.on(events.NewMessage(outgoing=True))
+async def owner_commands(event):
+    text = event.raw_text.strip()
+    if not text.startswith('.'): return
+
+    if text.startswith('.admin '):
+        nama = text.split('.admin ', 1)[1].strip()
+        if nama:
+            update_setting('nama_admin', nama)
+            await event.edit(f"✅ Nama admin CS: <b>{nama}</b>", parse_mode='html')
+
+    elif text == '.open':
+        update_setting('is_store_open', 'True')
+        await event.edit("🟢 <b>STATUS CS: BUKA</b>\n\nPelanggan baru akan menerima sambutan otomatis.", parse_mode='html')
+
+    elif text == '.close':
+        update_setting('is_store_open', 'False')
+        await event.edit("🔴 <b>STATUS CS: TUTUP</b>\n\nPelanggan akan menerima pesan 'CS tutup'.", parse_mode='html')
+
+    elif text == '.status':
+        nama = get_setting('nama_admin')
+        is_open = get_setting('is_store_open') == 'True'
+        auto = get_setting('auto_hours') == 'True'
+        hours_ok = is_within_working_hours()
+        stats = get_full_stats()
+        status_icon = "🟢 BUKA" if is_open else "🔴 TUTUP"
+        auto_info = f"⏰ <b>Auto Hours</b> : {'✅ ON' if auto else '❌ OFF'}"
+        if auto: auto_info += f" ({get_setting('work_start')}–{get_setting('work_end')})\n{'   '}Sekarang: {'dalam jam ✅' if hours_ok else 'luar jam ❌'}"
+        await event.edit(
+            f"📊 <b>DASHBOARD CS</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👩‍💼 <b>Admin</b>     : {nama}\n"
+            f"🏪 <b>Status</b>    : {status_icon}\n"
+            f"{auto_info}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👥 <b>Pelanggan</b> : {stats['users']}\n"
+            f"🔕 <b>Bisukan</b>   : {stats['muted']}\n"
+            f"🚫 <b>Blokir</b>    : {stats['blocked']}\n"
+            f"📋 <b>Template</b>  : {stats['templates']}\n"
+            f"🤖 <b>FAQ</b>       : {stats['faq']} (hits: {stats['faq_hits']})\n"
+            f"⭐ <b>Rating</b>    : {stats['ratings']} (avg: {stats['avg_rating']})\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔧 <b>SESSION:</b>\n"
+            f"<code>.terhubung ID</code> · <code>.akhiri ID</code>\n"
+            f"<code>.bisukan ID</code> · <code>.suara ID</code>\n"
+            f"<code>.blok ID [alasan]</code> · <code>.unblok ID</code>\n"
+            f"<code>.listbisukan</code> · <code>.listblok</code>\n\n"
+            f"📨 <b>TEMPLATE:</b>\n"
+            f"<code>.set t1 Teks</code> · <code>.setgambar t1</code> (reply foto)\n"
+            f"<code>.delgambar t1</code> · <code>.del t1</code> · <code>.listt</code>\n"
+            f"<code>.t1</code> … <code>.t10</code> → kirim cepat\n\n"
+            f"🤖 <b>FAQ:</b>\n"
+            f"<code>.faq add kata | jawaban</code>\n"
+            f"<code>.faq list</code> · <code>.faq del kata</code>\n\n"
+            f"📝 <b>NOTES:</b>\n"
+            f"<code>.catat ID teks</code> · <code>.note ID</code> · <code>.hapusnote ID</code>\n\n"
+            f"📊 <b>UTILITAS:</b>\n"
+            f"<code>.stats</code> · <code>.cari username</code> · <code>.rating</code>\n"
+            f"<code>.broadcast teks</code>\n"
+            f"<code>.jam 08:00-21:00</code> · <code>.auto on|off</code>",
+            parse_mode='html'
+        )
+
+    elif text.startswith('.terhubung '):
+        arg = text.split('.terhubung ', 1)[1].strip()
+        if not arg.isdigit():
+            await event.edit("⚠️ Format: <code>.terhubung 123456789</code>", parse_mode='html'); return
+        uid = int(arg)
+        if is_blocked(uid):
+            await event.edit(f"🚫 User <code>{uid}</code> diblokir. Buka: <code>.unblok {uid}</code>", parse_mode='html'); return
+        nama = get_setting('nama_admin')
+        try: target_user = await client.get_entity(uid)
+        except Exception: target_user = None
+        try:
+            sent = await client.send_message(uid, msg_connected(nama, user=target_user, user_id=uid), parse_mode='html', buttons=keyboard_connected(uid))
+            try: await client.pin_message(uid, sent.id, notify=True)
+            except Exception as e: log.warning(f"[PIN] {e}")
+            await event.edit(f"✅ <b>TERHUBUNG + PIN</b>\n🆔 <code>{uid}</code>\n👩‍💼 {nama}", parse_mode='html')
+        except Exception as e: await event.edit(f"❌ Gagal: <code>{type(e).__name__}</code>", parse_mode='html')
+
+    elif re.match(r"^\.akhiri\s+(\d+)$", text):
+        uid = int(re.match(r"^\.akhiri\s+(\d+)$", text).group(1))
+        if is_blocked(uid):
+            await event.edit(f"🚫 User <code>{uid}</code> diblokir.", parse_mode='html'); return
+        try: await client.send_message(uid, msg_ending(), parse_mode='html')
+        except Exception as e:
+            await event.edit(f"❌ Gagal: <code>{type(e).__name__}</code>", parse_mode='html'); return
+        unpin_status = "✅ Berhasil"
+        try: await client.unpin_message(uid)
+        except Exception as e: unpin_status = f"⚠️ {type(e).__name__}"
+        await send_rating_prompt(uid)
+        await event.edit(f"✅ <b>PERCAKAPAN DIAKHIRI</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🆔 <b>User ID</b>       : <code>{uid}</code>\n📩 <b>Pesan penutup</b> : Terkirim ✅\n📌 <b>Unpin kartu</b>   : {unpin_status}\n⭐ <b>Rating</b>        : Prompt dikirim\n━━━━━━━━━━━━━━━━━━━━━━", parse_mode='html')
+
+    elif re.match(r"^\.bisukan\s+(\d+)$", text):
+        uid = int(re.match(r"^\.bisukan\s+(\d+)$", text).group(1))
+        mute_user(uid)
+        await event.edit(f"🔕 <b>USER DIBISUKAN</b>\n\n🆔 <code>{uid}</code>\n\nBuka: <code>.suara {uid}</code>", parse_mode='html')
+
+    elif re.match(r"^\.suara\s+(\d+)$", text):
+        uid = int(re.match(r"^\.suara\s+(\d+)$", text).group(1))
+        unmute_user(uid)
+        await event.edit(f"🔔 <b>USER DIAKTIFKAN</b>\n\n🆔 <code>{uid}</code>", parse_mode='html')
+
+    elif re.match(r"^\.blok\s+(\d+)(?:\s+(.+))?$", text):
+        m = re.match(r"^\.blok\s+(\d+)(?:\s+(.+))?$", text)
+        uid, reason = int(m.group(1)), (m.group(2) or "").strip()
+        block_user(uid, reason)
+        await event.edit(f"🚫 <b>USER DIBLOKIR</b>\n\n🆔 <code>{uid}</code>\n📝 Alasan: {html.escape(reason) if reason else '(tidak ada)'}\n\nBuka: <code>.unblok {uid}</code>", parse_mode='html')
+
+    elif re.match(r"^\.unblok\s+(\d+)$", text):
+        uid = int(re.match(r"^\.unblok\s+(\d+)$", text).group(1))
+        unblock_user(uid)
+        await event.edit(f"✅ <b>BLOKIR DIBUKA</b>\n\n🆔 <code>{uid}</code>", parse_mode='html')
+
+    elif text == '.listbisukan':
+        users = list_muted()
+        if not users:
+            await event.edit("📭 Tidak ada user dibisukan.", parse_mode='html'); return
+        lines = [f"🔕 <b>DAFTAR BISUKAN ({len(users)})</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for uid in users: lines.append(f"• <code>{uid}</code>")
+        await event.edit("\n".join(lines), parse_mode='html')
+
+    elif text == '.listblok':
+        users = list_blocked()
+        if not users:
+            await event.edit("📭 Tidak ada user diblokir.", parse_mode='html'); return
+        lines = [f"🚫 <b>DAFTAR BLOKIR ({len(users)})</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for uid, reason in users:
+            r = f" — {html.escape(reason)}" if reason else ""
+            lines.append(f"• <code>{uid}</code>{r}")
+        await event.edit("\n".join(lines), parse_mode='html')
+
+    elif re.match(r"^\.faq\s+add\s+(.+?)\s*\|\s*(.+)$", text, re.IGNORECASE):
+        m = re.match(r"^\.faq\s+add\s+(.+?)\s*\|\s*(.+)$", text, re.IGNORECASE)
+        kw, resp = m.group(1).strip(), m.group(2).strip()
+        if not kw or not resp:
+            await event.edit("⚠️ Format: <code>.faq add kata kunci | jawaban</code>", parse_mode='html'); return
+        add_faq(kw, resp)
+        await event.edit(f"✅ <b>FAQ disimpan</b>\n\n🔑 Keyword: <code>{html.escape(kw.lower())}</code>\n💬 Jawaban: <blockquote>{html.escape(resp[:200])}</blockquote>", parse_mode='html')
+
+    elif re.match(r"^\.faq\s+del\s+(.+)$", text, re.IGNORECASE):
+        kw = re.match(r"^\.faq\s+del\s+(.+)$", text, re.IGNORECASE).group(1).strip()
+        if delete_faq(kw): await event.edit(f"🗑️ FAQ <code>{html.escape(kw)}</code> dihapus.", parse_mode='html')
+        else: await event.edit(f"⚠️ FAQ <code>{html.escape(kw)}</code> tidak ditemukan.", parse_mode='html')
+
+    elif text == '.faq list':
+        rows = list_faq()
+        if not rows:
+            await event.edit("📭 Belum ada FAQ.\n\nTambah: <code>.faq add harga | Harga produk mulai Rp50.000</code>", parse_mode='html'); return
+        lines = [f"🤖 <b>DAFTAR FAQ ({len(rows)})</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for kw, resp, hits in rows:
+            preview = resp.replace("\n", " ")[:60]
+            if len(resp) > 60: preview += "…"
+            lines.append(f"🔑 <code>{html.escape(kw)}</code> (hits: {hits})\n   ↳ {html.escape(preview)}")
+        await event.edit("\n\n".join(lines[:30]) + ("\n\n<i>...dan lainnya</i>" if len(rows) > 30 else ""), parse_mode='html')
+
+    elif re.match(r"^\.catat\s+(\d+)\s+([\s\S]+)$", text):
+        m = re.match(r"^\.catat\s+(\d+)\s+([\s\S]+)$", text)
+        uid, note = int(m.group(1)), m.group(2).strip()
+        add_note(uid, note)
+        await event.edit(f"📝 <b>Catatan ditambahkan</b>\n\n🆔 <code>{uid}</code>\n📄 <blockquote>{html.escape(note[:300])}</blockquote>", parse_mode='html')
+
+    elif re.match(r"^\.note\s+(\d+)$", text):
+        uid = int(re.match(r"^\.note\s+(\d+)$", text).group(1))
+        notes = get_notes(uid)
+        if not notes:
+            await event.edit(f"📭 Tidak ada catatan untuk <code>{uid}</code>", parse_mode='html'); return
+        lines = [f"📝 <b>CATATAN PELANGGAN</b> <code>{uid}</code> ({len(notes)})", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for note, created in notes[:20]: lines.append(f"• <i>{created[:16]}</i>\n  {html.escape(note[:200])}")
+        await event.edit("\n\n".join(lines), parse_mode='html')
+
+    elif re.match(r"^\.hapusnote\s+(\d+)$", text):
+        uid = int(re.match(r"^\.hapusnote\s+(\d+)$", text).group(1))
+        n = delete_notes(uid)
+        await event.edit(f"🗑️ <b>{n} catatan dihapus</b> untuk <code>{uid}</code>", parse_mode='html')
+
+    elif re.match(r"^\.set\s+t(\d{1,2})\s+([\s\S]+)$", text):
+        m = re.match(r"^\.set\s+t(\d{1,2})\s+([\s\S]+)$", text)
+        n, content = int(m.group(1)), m.group(2).strip()
+        if not (1 <= n <= MAX_TEMPLATE):
+            await event.edit(f"⚠️ Template hanya 1–{MAX_TEMPLATE}."); return
+        key = f"t{n}"
+        upsert_template_text(key, content)
+        preview = html.escape(content[:300]) + ("…" if len(content) > 300 else "")
+        await event.edit(f"✅ <b>Template {key} disimpan</b>\n\n<blockquote>{preview}</blockquote>", parse_mode='html')
+
+    elif re.match(r"^\.setgambar\s+t(\d{1,2})$", text):
+        n = int(re.match(r"^\.setgambar\s+t(\d{1,2})$", text).group(1))
+        if not (1 <= n <= MAX_TEMPLATE): return
+        key = f"t{n}"
+        if not event.reply_to_msg_id:
+            await event.edit(f"⚠️ Reply ke foto dulu, lalu kirim <code>.setgambar {key}</code>", parse_mode='html'); return
+        replied = await event.get_reply_message()
+        if not replied or not replied.media:
+            await event.edit("⚠️ Pesan yang di-reply bukan media."); return
+        await event.edit(f"⏳ Mengunduh media untuk <b>{key}</b>...", parse_mode='html')
+        try:
+            ext = ".jpg"
+            if replied.document and replied.document.mime_type:
+                mt = replied.document.mime_type
+                if "png" in mt: ext = ".png"
+                elif "gif" in mt: ext = ".gif"
+                elif "mp4" in mt: ext = ".mp4"
+                elif "webp" in mt: ext = ".webp"
+            for old in MEDIA_DIR.glob(f"{key}.*"):
+                try: old.unlink()
+                except: pass
+            file_path = str(MEDIA_DIR / f"{key}{ext}")
+            await client.download_media(replied, file=file_path)
+            upsert_template_media(key, file_path)
+            await event.edit(f"✅ <b>Gambar tersimpan ke {key}</b>\n\n📁 <code>{file_path}</code>", parse_mode='html')
+        except Exception as e: await event.edit(f"❌ Gagal: <code>{html.escape(str(e))}</code>", parse_mode='html')
+
+    elif re.match(r"^\.delgambar\s+t(\d{1,2})$", text):
+        n = int(re.match(r"^\.delgambar\s+t(\d{1,2})$", text).group(1))
+        if 1 <= n <= MAX_TEMPLATE:
+            clear_template_media(f"t{n}")
+            await event.edit(f"✅ Gambar <code>t{n}</code> dihapus.", parse_mode='html')
+
+    elif re.match(r"^\.del\s+t(\d{1,2})$", text):
+        n = int(re.match(r"^\.del\s+t(\d{1,2})$", text).group(1))
+        if 1 <= n <= MAX_TEMPLATE:
+            delete_template(f"t{n}")
+            await event.edit(f"🗑️ Template <code>t{n}</code> dihapus.", parse_mode='html')
+
+    elif text == '.listt':
+        rows = list_all_templates()
+        if not rows:
+            await event.edit("📭 Belum ada template.\n\nBuat: <code>.set t1 Halo Kak...</code>", parse_mode='html'); return
+        lines = ["📋 <b>DAFTAR TEMPLATE</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for key, content, fp in rows:
+            icon = "🖼️" if (fp and os.path.exists(fp)) else "📝"
+            preview = (content or "(tanpa teks)").replace("\n", " ")[:60]
+            lines.append(f"{icon} <b>{key}</b> → {html.escape(preview)}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("💡 <code>.t1</code> … <code>.t10</code>")
+        await event.edit("\n".join(lines), parse_mode='html')
+
+    elif re.match(r"^\.t(\d{1,2})(?:\s+(\d+))?$", text):
+        m = re.match(r"^\.t(\d{1,2})(?:\s+(\d+))?$", text)
+        n = int(m.group(1))
+        explicit_target = int(m.group(2)) if m.group(2) else None
+        if not (1 <= n <= MAX_TEMPLATE):
+            await event.edit(f"⚠️ Template hanya 1–{MAX_TEMPLATE}."); return
+        key = f"t{n}"
+        if not get_template(key):
+            await event.edit(f"⚠️ Template <code>{key}</code> belum ada.\nSet: <code>.set {key} Teks</code>", parse_mode='html'); return
+
+        if event.is_private and explicit_target is None:
+            if is_blocked(event.chat_id):
+                await event.edit("🚫 User diblokir."); return
+            text_content, fp = get_template(key)
+            if fp and os.path.exists(fp):
+                await event.delete()
+                ok, err = await send_template(event.chat_id, key)
+                if not ok: await client.send_message(event.chat_id, f"❌ {err}")
+            else: await event.edit(text_content or "")
+            return
+
+        target = explicit_target
+        if target is None and event.is_group and event.reply_to_msg_id:
+            target = get_user_from_report(event.reply_to_msg_id)
+        if target is None:
+            await event.edit("⚠️ Target tidak diketahui.\n\nGunakan:\n• Chat pribadi → <code>.t1</code>\n• Reply laporan grup → <code>.t1</code>\n• Manual → <code>.t1 123456789</code>", parse_mode='html'); return
+
+        ok, err = await send_template(target, key)
+        if ok: await event.edit(f"✅ <code>{key}</code> terkirim ke <code>{target}</code>", parse_mode='html')
+        else: await event.edit(f"❌ Gagal: <code>{html.escape(str(err))}</code>", parse_mode='html')
+
+    elif text == '.stats':
+        stats = get_full_stats()
+        await event.edit(f"📊 <b>STATISTIK LENGKAP</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👥 <b>Total Pelanggan</b> : {stats['users']}\n🔕 <b>Dibisukan</b>       : {stats['muted']}\n🚫 <b>Diblokir</b>        : {stats['blocked']}\n📋 <b>Template</b>        : {stats['templates']}\n🤖 <b>FAQ</b>             : {stats['faq']}\n🎯 <b>FAQ Hits</b>        : {stats['faq_hits']}\n⭐ <b>Total Rating</b>    : {stats['ratings']}\n📈 <b>Rata-rata Rating</b>: {stats['avg_rating']} / 5\n━━━━━━━━━━━━━━━━━━━━━━", parse_mode='html')
+
+    elif text == '.rating':
+        count, avg = get_rating_stats()
+        if count == 0:
+            await event.edit("📭 Belum ada rating masuk.", parse_mode='html'); return
+        stars = "⭐" * round(avg)
+        await event.edit(f"⭐ <b>RATING PELAYANAN</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📊 <b>Total Rating</b> : {count}\n📈 <b>Rata-rata</b>    : {avg} / 5\n🌟 <b>Visual</b>       : {stars}\n━━━━━━━━━━━━━━━━━━━━━━", parse_mode='html')
+
+    elif text.startswith('.cari '):
+        query = text.split('.cari ', 1)[1].strip().lstrip('@')
+        if not query:
+            await event.edit("⚠️ Format: <code>.cari username</code>", parse_mode='html'); return
+        await event.edit(f"🔍 Mencari <code>{html.escape(query)}</code>...", parse_mode='html')
+        results = await search_users(query)
+        if not results:
+            await event.edit(f"❌ Tidak ditemukan user dengan <code>{html.escape(query)}</code>", parse_mode='html'); return
+        lines = [f"🔍 <b>HASIL PENCARIAN ({len(results)})</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for user in results:
+            uname = f"@{user.username}" if user.username else "-"
+            lines.append(f"👤 <b>{html.escape(user.first_name or 'N/A')}</b>\n   🔗 {uname}\n   🆔 <code>{user.id}</code>")
+        await event.edit("\n\n".join(lines), parse_mode='html')
+
+    elif text.startswith('.broadcast '):
+        content = text.split('.broadcast ', 1)[1].strip()
+        if not content:
+            await event.edit("⚠️ Format: <code>.broadcast Teks pesan</code>", parse_mode='html'); return
+        stats = get_full_stats()
+        preview = html.escape(content[:300]) + ("…" if len(content) > 300 else "")
+        await event.edit(f"📢 <b>KONFIRMASI BROADCAST</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👥 Target: <b>{stats['users']} pelanggan</b>\n━━━━━━━━━━━━━━━━━━━━━━\n<blockquote>{preview}</blockquote>\n━━━━━━━━━━━━━━━━━━━━━━\n<i>Klik tombol untuk konfirmasi.</i>", buttons=[[Button.inline("✅ Kirim", data="bcast_confirm"), Button.inline("❌ Batal", data="bcast_cancel")]], parse_mode='html')
+        _pending_broadcast[event.chat_id] = content
+
+    elif re.match(r"^\.jam\s+(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})$", text):
+        m = re.match(r"^\.jam\s+(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})$", text)
+        start, end = m.group(1), m.group(2)
+        update_setting('work_start', start)
+        update_setting('work_end', end)
+        await event.edit(f"⏰ <b>JAM OPERASIONAL DISET</b>\n\n🌅 Buka : <b>{start}</b>\n🌙 Tutup: <b>{end}</b>\n\n<i>Aktifkan auto: <code>.auto on</code></i>", parse_mode='html')
+
+    elif text in ('.auto on', '.auto off'):
+        val = 'True' if text.endswith('on') else 'False'
+        update_setting('auto_hours', val)
+        if val == 'True': await event.edit(f"✅ <b>AUTO HOURS ON</b>\n\nCS akan otomatis buka {get_setting('work_start')} dan tutup {get_setting('work_end')}.", parse_mode='html')
+        else: await event.edit("❌ <b>AUTO HOURS OFF</b>\n\nBuka/tutup manual via <code>.open</code> / <code>.close</code>", parse_mode='html')
+
+# =========================================================
+# AUTO WELCOME + LAPORAN
+# =========================================================
+@client.on(events.NewMessage(incoming=True))
+async def auto_reply(event):
+    if not (event.is_private and not event.out): return
+    sender_id = event.sender_id
+    check_auto_status()
+
+    if is_blocked(sender_id):
+        log.info(f"[BLOCKED] {sender_id}"); return
+    if is_muted(sender_id):
+        log.info(f"[MUTED] {sender_id}"); return
+
+    is_open = get_setting('is_store_open') == 'True'
+    if not is_open:
+        if not is_spamming(sender_id):
+            try: await event.reply(msg_closed())
+            except Exception as e: log.error(f"[CLOSED] {e}")
+        return
+
+    if is_spamming(sender_id): return
+
+    text_in = event.raw_text or ""
+    if not is_user_responded(sender_id):
+        sender = await event.get_sender()
+        try: await event.reply(msg_welcome())
+        except Exception as e: log.error(f"[WELCOME] {e}")
+        add_responded_user(sender_id)
+        try:
+            report_msg = await client.send_message(GROUP_ADMIN_ID, msg_report(sender, text_in), parse_mode='html', buttons=keyboard_report(sender_id))
+            save_report_message(report_msg.id, sender_id)
+            log.info(f"[REPORT] user={sender_id} msg_id={report_msg.id}")
+        except Exception as e: log.error(f"[ERROR GRUP] {type(e).__name__}: {e}")
+
+    faq_resp = check_faq(sender_id, text_in)
+    if faq_resp:
+        try:
+            await asyncio.sleep(0.8)
+            await event.reply(faq_resp)
+        except Exception as e: log.error(f"[FAQ] {e}")
+
+# =========================================================
+# HANDLE TOMBOL
+# =========================================================
+_pending_broadcast: dict = {}
+
+@client.on(events.CallbackQuery())
+async def handle_callback(event):
+    data = event.data.decode()
+
+    if data.startswith("connect_"):
+        try: uid = int(data.split("_", 1)[1])
+        except: return await event.answer("⚠️ Data tidak valid.", alert=True)
+        if is_blocked(uid): return await event.answer("🚫 User diblokir.", alert=True)
+        nama = get_setting('nama_admin')
+        try: target_user = await client.get_entity(uid)
+        except: target_user = None
+        try:
+            sent = await client.send_message(uid, msg_connected(nama, user=target_user, user_id=uid), parse_mode='html', buttons=keyboard_connected(uid))
+            try: await client.pin_message(uid, sent.id, notify=True)
+            except Exception as e: log.warning(f"[PIN] {e}")
+        except Exception as e:
+            log.error(f"[ERROR SEND] {e}")
+            return await event.answer("❌ Gagal menghubungi pelanggan.", alert=True)
+        await event.edit(text=event.message.text + f"\n\n✅ <b>STATUS:</b> Terhubung dengan <b>{nama}</b> (📌 di-pin).", buttons=[[Button.inline("👤 Profil", data=f"profile_{uid}"), Button.inline("📝 Note", data=f"note_{uid}"), Button.inline("✅ Selesai", data=f"done_{uid}")]], parse_mode='html')
+        await event.answer(f"✅ Terhubung dengan {nama} & di-pin.")
+
+    elif data.startswith("profile_"):
+        try: uid = int(data.split("_", 1)[1])
+        except: return await event.answer("⚠️ Data tidak valid.", alert=True)
+        try:
+            user = await client.get_entity(uid)
+            uname = f"@{user.username}" if user.username else "-"
+            notes = get_notes(uid)
+            rating = get_user_rating(uid)
+            rating_str = f"{'⭐' * rating[0]} ({rating[0]}/5)" if rating else "Belum ada"
+            info = f"👤 Profil Pelanggan\n━━━━━━━━━━━━━━━━━\nNama     : {user.first_name or '-'}\nUsername : {uname}\nUser ID  : {user.id}\nNotes    : {len(notes)} catatan\nRating   : {rating_str}"
+            await event.answer(info, alert=True)
+        except Exception as e:
+            log.error(f"[PROFILE] {e}")
+            await event.answer("❌ Tidak bisa memuat profil.", alert=True)
+
+    elif data.startswith("note_"):
+        try: uid = int(data.split("_", 1)[1])
+        except: return await event.answer("⚠️ Data tidak valid.", alert=True)
+        notes = get_notes(uid)
+        if not notes: return await event.answer(f"📭 Belum ada catatan untuk user ini.\nTambah: .catat {uid} teks", alert=True)
+        text = f"📝 Catatan ({len(notes)}):\n\n"
+        for note, created in notes[:5]: text += f"• {created[:16]}\n  {note[:100]}\n\n"
+        await event.answer(text, alert=True)
+
+    elif data.startswith("done_"):
+        await event.edit(text=event.message.text + "\n\n✅ <b>STATUS:</b> Percakapan ditandai selesai.", buttons=None, parse_mode='html')
+        await event.answer("✅ Ditandai selesai.")
+
+    elif data.startswith("call_"):
+        try: uid = int(data.split("_", 1)[1])
+        except: return await event.answer("⚠️ Data tidak valid.", alert=True)
+        nama = get_setting('nama_admin')
+        await event.answer("📞 Admin telah diberitahu.", alert=True)
+        try: await client.send_message(GROUP_ADMIN_ID, f"🔔 <b>PANGGILAN PELANGGAN</b>\n\n🆔 User ID: <code>{uid}</code>\n👩‍💼 Admin  : {nama}\n💬 Pelanggan menekan tombol <b>Panggil Admin</b>.\n\nMohon segera direspons ya. 🙏", parse_mode='html')
+        except Exception as e: log.error(f"[CALL] {e}")
+
+    elif data.startswith("endsession_"):
+        try: uid = int(data.split("_", 1)[1])
+        except: return await event.answer("⚠️ Data tidak valid.", alert=True)
+        try: await client.unpin_message(uid)
+        except Exception as e: log.warning(f"[UNPIN] {e}")
+        await event.edit(msg_ending(), buttons=None, parse_mode='html')
+        await event.answer("✅ Sesi diakhiri.")
+        await send_rating_prompt(uid)
+
+    elif data.startswith("rate_"):
+        parts = data.split("_")
+        if len(parts) < 3: return await event.answer("⚠️ Data tidak valid.", alert=True)
+        try: stars, uid = int(parts[1]), int(parts[2])
+        except: return await event.answer("⚠️ Data tidak valid.", alert=True)
+        if not (1 <= stars <= 5): return await event.answer("⚠️ Rating harus 1-5.", alert=True)
+        add_rating(uid, stars)
+        await event.edit(f"{'⭐' * stars}\n\n<b>TERIMA KASIH ATAS RATINGNYA! 🙏</b>\n\nKakak memberi <b>{stars}/5 bintang</b>.\nMasukan Kakak sangat berarti untuk kami. 💫\n\n<i>Sampai jumpa lagi! 👋</i>", buttons=None, parse_mode='html')
+        await event.answer(f"✅ Rating {stars}/5 tersimpan!")
+        try: await client.send_message(GROUP_ADMIN_ID, f"⭐ <b>RATING BARU MASUK</b>\n\n🆔 User: <code>{uid}</code>\n⭐ Rating: {'⭐' * stars} ({stars}/5)", parse_mode='html')
+        except Exception as e: log.warning(f"[RATING NOTIFY] {e}")
+
+    elif data == "bcast_confirm":
+        content = _pending_broadcast.pop(event.chat_id, None)
+        if not content: return await event.answer("⚠️ Tidak ada broadcast pending.", alert=True)
+        await event.edit("📢 <b>Mengirim broadcast...</b>", parse_mode='html')
+        success, failed = await broadcast_message(content)
+        await event.edit(f"📢 <b>BROADCAST SELESAI</b>\n━━━━━━━━━━━━━━━━━━━━━━\n✅ Sukses : {success}\n❌ Gagal  : {failed}\n━━━━━━━━━━━━━━━━━━━━━━", parse_mode='html')
+        await event.answer(f"✅ {success} terkirim, {failed} gagal.")
+
+    elif data == "bcast_cancel":
+        _pending_broadcast.pop(event.chat_id, None)
+        await event.edit("❌ <b>Broadcast dibatalkan.</b>", parse_mode='html')
+        await event.answer("Dibatalkan.")
+
+# =========================================================
+# AUTO SCHEDULER
+# =========================================================
+async def _auto_status_loop():
+    while True:
+        try: check_auto_status()
+        except Exception as e: log.warning(f"[AUTO LOOP] {e}")
+        await asyncio.sleep(60)
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    init_db()
+    print("=" * 55)
+    print("   USERBOT CS - FINAL EDITION v5")
+    print("=" * 55)
+    print(f"Admin   : {get_setting('nama_admin')}")
+    print(f"Status  : {'BUKA' if get_setting('is_store_open') == 'True' else 'TUTUP'}")
+    print(f"Hours   : {get_setting('work_start')}–{get_setting('work_end')} (auto: {get_setting('auto_hours')})")
+    print(f"Media   : {MEDIA_DIR.absolute()}")
+    print("-" * 55)
+    client.start()
+    print("✅ Bot aktif. Tekan Ctrl+C untuk berhenti.")
+    client.loop.create_task(_auto_status_loop())
+    client.run_until_disconnected()
+
+if __name__ == '__main__':
+    main()

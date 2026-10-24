@@ -1,0 +1,434 @@
+import sqlite3
+import time
+import os
+import re
+import html
+import random
+import asyncio
+import pathlib
+import logging
+from datetime import datetime
+from telethon import TelegramClient, events, Button
+
+# =========================================================
+# KONFIGURASI
+# =========================================================
+API_ID   = int(os.environ.get("API_ID", 35443397))
+API_HASH = os.environ.get("API_HASH", "4888086e2b51b7f0fb98de5eb419e468")
+GROUP_ADMIN_ID = int(os.environ.get("GROUP_ADMIN_ID", -1004488215589))
+
+SPAM_COOLDOWN = 30
+FAQ_COOLDOWN  = 60
+DB_NAME       = "bot_cs_data.db"
+MEDIA_DIR     = pathlib.Path("media_templates")
+MAX_TEMPLATE  = 10
+
+MEDIA_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()],
+)
+log = logging.getLogger("csbot")
+
+client = TelegramClient('sesi_cs_pribadi', API_ID, API_HASH)
+
+# =========================================================
+# DATABASE
+# =========================================================
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("CREATE TABLE IF NOT EXISTS responded_users (user_id INTEGER PRIMARY KEY)")
+        cur.execute("CREATE TABLE IF NOT EXISTS templates (key TEXT PRIMARY KEY, text TEXT, file_path TEXT)")
+        cur.execute("CREATE TABLE IF NOT EXISTS report_messages (message_id INTEGER PRIMARY KEY, user_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS muted_users (user_id INTEGER PRIMARY KEY, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS blocked_users (user_id INTEGER PRIMARY KEY, reason TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS faq (keyword TEXT PRIMARY KEY, response TEXT NOT NULL, hit_count INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, note TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS ratings (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, rating INTEGER, comment TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+
+        defaults = {
+            'nama_admin': 'Siti',
+            'is_store_open': 'True',
+            'work_start': '08:00',
+            'work_end': '21:00',
+            'auto_hours': 'False',
+            'rating_enabled': 'True',
+            'welcome_hint': 'True',
+        }
+        for k, v in defaults.items():
+            cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+        conn.commit()
+
+def get_setting(key, default=None):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+def update_setting(key, value):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+        conn.commit()
+
+# =========================================================
+# WORKING HOURS
+# =========================================================
+def is_within_working_hours() -> bool:
+    start = get_setting('work_start', '08:00')
+    end = get_setting('work_end', '21:00')
+    now = datetime.now().strftime('%H:%M')
+    return start <= now <= end
+
+def check_auto_status():
+    if get_setting('auto_hours', 'False') != 'True':
+        return False
+    should_open = is_within_working_hours()
+    current = get_setting('is_store_open') == 'True'
+    if should_open != current:
+        update_setting('is_store_open', 'True' if should_open else 'False')
+        log.info(f"[AUTO] CS auto {'OPEN' if should_open else 'CLOSE'}")
+        return True
+    return False
+
+# =========================================================
+# HELPER TEMPLATE
+# =========================================================
+def get_template(key: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT text, file_path FROM templates WHERE key = ?", (key,))
+        return cur.fetchone()
+
+def upsert_template_text(key: str, text: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO templates (key, text) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET text = excluded.text", (key, text))
+        conn.commit()
+
+def upsert_template_media(key: str, file_path: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO templates (key, file_path) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET file_path = excluded.file_path", (key, file_path))
+        conn.commit()
+
+def clear_template_media(key: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT file_path FROM templates WHERE key = ?", (key,))
+        row = cur.fetchone()
+        if row and row[0]:
+            try: os.remove(row[0])
+            except FileNotFoundError: pass
+        cur.execute("UPDATE templates SET file_path = NULL WHERE key = ?", (key,))
+        conn.commit()
+
+def delete_template(key: str):
+    clear_template_media(key)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM templates WHERE key = ?", (key,))
+        conn.commit()
+
+def list_all_templates():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT key, text, file_path FROM templates ORDER BY key")
+        return cur.fetchall()
+
+def save_report_message(message_id: int, user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO report_messages (message_id, user_id) VALUES (?, ?)", (message_id, user_id))
+        conn.commit()
+
+def get_user_from_report(message_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM report_messages WHERE message_id = ?", (message_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+# =========================================================
+# FAQ
+# =========================================================
+def add_faq(keyword: str, response: str):
+    kw = keyword.strip().lower()
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO faq (keyword, response) VALUES (?, ?) ON CONFLICT(keyword) DO UPDATE SET response = excluded.response", (kw, response))
+        conn.commit()
+
+def delete_faq(keyword: str) -> bool:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM faq WHERE keyword = ?", (keyword.strip().lower(),))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        return deleted
+
+def list_faq():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT keyword, response, hit_count FROM faq ORDER BY hit_count DESC, keyword")
+        return cur.fetchall()
+
+def count_faq() -> int:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM faq")
+        return cur.fetchone()[0]
+
+_last_faq_time: dict = {}
+
+def check_faq(user_id: int, text: str):
+    now = time.time()
+    if now - _last_faq_time.get(user_id, 0) < FAQ_COOLDOWN:
+        return None
+    if not text: return None
+    text_lower = text.lower()
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT keyword, response FROM faq ORDER BY LENGTH(keyword) DESC")
+        for keyword, response in cur.fetchall():
+            if keyword in text_lower:
+                cur.execute("UPDATE faq SET hit_count = hit_count + 1 WHERE keyword = ?", (keyword,))
+                conn.commit()
+                _last_faq_time[user_id] = now
+                return response
+    return None
+
+# =========================================================
+# NOTES
+# =========================================================
+def add_note(user_id: int, note: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO notes (user_id, note) VALUES (?, ?)", (user_id, note))
+        conn.commit()
+
+def get_notes(user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT note, created_at FROM notes WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
+        return cur.fetchall()
+
+def delete_notes(user_id: int) -> int:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM notes WHERE user_id = ?", (user_id,))
+        n = cur.rowcount
+        conn.commit()
+        return n
+
+# =========================================================
+# RATINGS
+# =========================================================
+def add_rating(user_id: int, rating: int, comment: str = ""):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO ratings (user_id, rating, comment) VALUES (?, ?, ?)", (user_id, rating, comment))
+        conn.commit()
+
+def get_rating_stats():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), AVG(rating) FROM ratings")
+        count, avg = cur.fetchone()
+        return count or 0, round(avg or 0, 2)
+
+def get_user_rating(user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT rating, comment FROM ratings WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", (user_id,))
+        return cur.fetchone()
+
+# =========================================================
+# STATS
+# =========================================================
+def get_full_stats():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM responded_users"); total_users = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM muted_users"); total_muted = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM blocked_users"); total_blocked = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM faq"); total_faq = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM templates"); total_tpl = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*), AVG(rating) FROM ratings"); r_count, r_avg = cur.fetchone()
+        cur.execute("SELECT SUM(hit_count) FROM faq"); total_hit = cur.fetchone()[0] or 0
+    return {'users': total_users, 'muted': total_muted, 'blocked': total_blocked, 'faq': total_faq, 'templates': total_tpl, 'ratings': r_count or 0, 'avg_rating': round(r_avg or 0, 2), 'faq_hits': total_hit}
+
+# =========================================================
+# HELPER USER
+# =========================================================
+_memory_users: set = set()
+_last_message_time: dict = {}
+_spam_count: dict = {}
+_muted_cache: set = set()
+_blocked_cache: set = set()
+
+def is_user_responded(user_id: int) -> bool:
+    if user_id in _memory_users: return True
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM responded_users WHERE user_id = ?", (user_id,))
+        found = cur.fetchone() is not None
+    if found: _memory_users.add(user_id)
+    return found
+
+def add_responded_user(user_id: int):
+    _memory_users.add(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO responded_users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+def is_spamming(user_id: int) -> bool:
+    now = time.time()
+    last = _last_message_time.get(user_id, 0)
+    count = _spam_count.get(user_id, 0)
+    cooldown = SPAM_COOLDOWN + (count * 5)
+    if now - last < cooldown:
+        _spam_count[user_id] = min(count + 1, 10)
+        return True
+    _last_message_time[user_id] = now
+    if now - last > cooldown * 2: _spam_count[user_id] = 0
+    return False
+
+# =========================================================
+# MUTE / BLOCK
+# =========================================================
+def is_muted(user_id: int) -> bool:
+    if user_id in _muted_cache: return True
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM muted_users WHERE user_id = ?", (user_id,))
+        if cur.fetchone():
+            _muted_cache.add(user_id)
+            return True
+    return False
+
+def is_blocked(user_id: int) -> bool:
+    if user_id in _blocked_cache: return True
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM blocked_users WHERE user_id = ?", (user_id,))
+        if cur.fetchone():
+            _blocked_cache.add(user_id)
+            return True
+    return False
+
+def mute_user(user_id: int):
+    _muted_cache.add(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO muted_users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+def unmute_user(user_id: int):
+    _muted_cache.discard(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM muted_users WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+def block_user(user_id: int, reason: str = ""):
+    _blocked_cache.add(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO blocked_users (user_id, reason) VALUES (?, ?)", (user_id, reason))
+        conn.commit()
+
+def unblock_user(user_id: int):
+    _blocked_cache.discard(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM blocked_users WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+def list_muted():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM muted_users ORDER BY created_at DESC")
+        return [r[0] for r in cur.fetchall()]
+
+def list_blocked():
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, reason FROM blocked_users ORDER BY created_at DESC")
+        return cur.fetchall()
+
+# =========================================================
+# TEXT TEMPLATES
+# =========================================================
+_last_choice: dict = {}
+
+def _pick(variants, key):
+    if len(variants) == 1: return variants[0]
+    prev = _last_choice.get(key)
+    choices = [v for v in variants if v != prev] or variants
+    chosen = random.choice(choices)
+    _last_choice[key] = chosen
+    return chosen
+
+def msg_welcome() -> str:
+    base = _pick([
+        "Halo Kak 👋 Terima kasih sudah menghubungi kami!\nPesan Kakak sudah masuk, admin akan segera merespons. 🙏",
+        "Hai Kak 😊 Selamat datang di CS kami.\nMohon tunggu sebentar ya, admin segera membantu. ✨",
+        "Halo Kak 👋 Pesan Kakak sudah kami terima.\nAdmin sedang bersiap, mohon ditunggu ya. 🙏",
+        "Hai Kak 😊 Terima kasih sudah chat.\nKeluhan atau pertanyaan Kakak akan segera kami proses. 🚀",
+        "Halo Kak 🙏 Terima kasih sudah menghubungi CS kami.\nMohon tunggu sebentar, admin akan segera hadir. ✨",
+        "Hai Kak 👋 Pesan Kakak sudah kami terima.\nMohon ditunggu ya, admin kami siap membantu. 😊",
+        "Halo Kak 😊 Terima kasih sudah menghubungi kami.\nAdmin akan segera merespons pesan Kakak. 🙏",
+        "Hai Kak 👋 Salam dari CS kami.\nPesan Kakak sedang dalam antrian, mohon tunggu sebentar. ⏳",
+        "Halo Kak 😊 Terima kasih sudah chat dengan kami.\nKami akan segera membantu Kakak. 🌟",
+        "Hai Kak 🙏 Pesan Kakak sudah masuk.\nTunggu sebentar ya, admin segera merespons. ✨",
+    ], key="welcome")
+    if get_setting('welcome_hint', 'True') == 'True' and count_faq() > 0:
+        base += "\n\n<i>💡 Butuh jawaban cepat? Coba ketik kata kunci seperti \"harga\", \"ongkir\", atau \"jam buka\".</i>"
+    return base
+
+def msg_closed() -> str:
+    start = get_setting('work_start', '08:00')
+    end = get_setting('work_end', '21:00')
+    jam = f"({start} - {end} WIB)" if get_setting('auto_hours') == 'True' else ""
+    return _pick([
+        f"Halo Kak 🙏 Mohon maaf, CS kami sedang <b>TUTUP</b>.\nPesan Kakak akan dibalas saat kami buka kembali {jam}. 🕐",
+        f"Hai Kak 😊 Maaf ya, saat ini CS sedang tidak aktif {jam}.\nPesan Kakak sudah kami simpan, akan dibalas nanti. 🙏",
+        f"Halo Kak 🕐 CS kami sedang di luar jam operasional {jam}.\nTenang, pesan Kakak akan segera kami balas saat buka. 🙏",
+        f"Hai Kak 🙏 Mohon maaf, layanan CS sedang TUTUP {jam}.\nPesan Kakak kami simpan, akan dibalas saat kami buka. 😊",
+        f"Halo Kak 😊 Maaf, CS kami sedang tidak tersedia {jam}.\nPesan Kakak akan segera dibalas saat jam operasional. 🙏",
+    ], key="closed")
+
+def generate_ticket_id(user_id: int) -> str:
+    return f"CS-{datetime.now().strftime('%y%m%d')}-{str(user_id)[-4:].zfill(4)}"
+
+def msg_connected(nama_admin: str, user=None, user_id: int = None) -> str:
+    waktu = datetime.now().strftime("%d %b %Y • %H:%M")
+    tiket = generate_ticket_id(user_id or 0)
+    nama_user = html.escape(user.first_name) if user and user.first_name else "Pelanggan"
+    sapaan = random.choice(["🎉 <b>TERHUBUNG DENGAN CS</b>", "✨ <b>KAKAK SUDAH TERHUBUNG</b>", "🔗 <b>KONEKSI BERHASIL</b>", "💫 <b>ADMIN SIAP MEMBANTU</b>", "🌟 <b>SESI CS DIMULAI</b>"])
+    closing = random.choice(["Silakan sampaikan pertanyaan atau keluhan Kakak. Kami siap membantu! 😊", "Ada yang bisa kami bantu, Kak? Silakan sampaikan ya. 🙏", "Mohon sampaikan pesan Kakak, kami akan segera memprosesnya. ✨", "Kami mendengarkan, Kak. Silakan sampaikan keluhan atau pertanyaan. 💬", "Sampaikan apa yang bisa kami bantu, Kak. Kami siap membantu. 🚀"])
+    return f"{sapaan}\n━━━━━━━━━━━━━━━━━━━━━━\n🎫 <b>No. Tiket</b>  : <code>{tiket}</code>\n👤 <b>Pelanggan</b>  : {nama_user}\n👩‍💼 <b>Admin CS</b>   : <b>{html.escape(nama_admin)}</b>\n🕐 <b>Waktu</b>      : {waktu}\n━━━━━━━━━━━━━━━━━━━━━━\n\n{closing}\n\n<i>💡 Simpan nomor tiket untuk referensi ya, Kak.</i>"
+
+def msg_ending() -> str:
+    return _pick([
+        "🙏 <b>TERIMA KASIH</b>\n\nPercakapan ini telah selesai.\nSenang bisa membantu Kakak hari ini. 😊\n\n<i>Kalau butuh bantuan lagi, silakan chat kami kembali ya! ✨</i>",
+        "✨ <b>SESI SELESAI</b>\n\nTerima kasih sudah menghubungi CS kami, Kak.\nSemoga masalahnya sudah teratasi ya. 🙏\n\n<i>Sampai jumpa lagi! 👋</i>",
+        "💫 <b>PERCAKAPAN DITUTUP</b>\n\nTerima kasih atas kepercayaan Kakak kepada kami.\nKami selalu siap membantu kapan pun dibutuhkan. 😊\n\n<i>Semoga harimu menyenangkan! 🌟</i>",
+        "🌟 <b>TERIMA KASIH SUDAH MENGHUBUNGI KAMI</b>\n\nSesi CS ini resmi berakhir.\nSemoga kami bisa membantu lagi di lain waktu, Kak. 🙏\n\n<i>Have a great day! ✨</i>",
+        "🎉 <b>SELESAI</b>\n\nTerima kasih sudah menghubungi kami, Kak.\nJika ada pertanyaan lain, jangan ragu untuk chat kami lagi. 😊\n\n<i>Sukses selalu untuk Kakak! 🚀</i>",
+    ], key="ending")
+
+def msg_rating_prompt() -> str:
+    return _pick(["⭐ <b>BAGAIMANA PELAYANAN KAMI?</b>\n\nBeri rating untuk membantu kami jadi lebih baik 🙏", "💫 <b>RATING PELAYANAN</b>\n\nSeberapa puas Kakak dengan bantuan kami hari ini?", "🌟 <b>PUAS DENGAN LAYANAN KAMI?</b>\n\nBeri bintang untuk pengalaman Kakak hari ini."], key="rating_prompt")
+
+def msg_report(sender, text: str) -> str:
+    uname = f"@{sender.username}" if sender.username else "Tidak tersedia"
+    waktu = datetime.now().strftime("%d %b %Y • %H:%M")
+    safe_text = html.escape(text or "[Media
